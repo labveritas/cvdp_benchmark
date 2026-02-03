@@ -34,7 +34,7 @@ class GitRepositoryManager:
     - Thread-safe operations with per-repository locking
     """
     
-    def __init__(self, cache_dir: str):
+    def __init__(self, cache_dir: str, use_docker: bool = True):
         """
         Initialize the git repository manager.
         
@@ -42,6 +42,7 @@ class GitRepositoryManager:
             cache_dir: Base directory for storing git mirrors and logs
         """
         self.cache_dir = cache_dir
+        self.use_docker = use_docker
         self.mirrors_dir = os.path.join(cache_dir, "mirrors")
         self.logs_dir = os.path.join(cache_dir, "logs")
         
@@ -49,8 +50,9 @@ class GitRepositoryManager:
         os.makedirs(self.mirrors_dir, exist_ok=True)
         os.makedirs(self.logs_dir, exist_ok=True)
         
-        # Ensure patch_image Docker image exists
-        self._ensure_patch_image()
+        # Ensure patch_image Docker image exists for Docker-based workflows
+        if self.use_docker:
+            self._ensure_patch_image()
     
     def _ensure_patch_image(self):
         """
@@ -206,6 +208,9 @@ class GitRepositoryManager:
         Returns:
             True if successful, False otherwise
         """
+        if not self.use_docker:
+            print("[ERROR] create_volume_with_checkout requires Docker but use_docker=False")
+            return False
         try:
             # Get shared mirror
             mirror_path = self.get_or_create_mirror(repo_url)
@@ -392,6 +397,58 @@ class GitRepositoryManager:
         except subprocess.CalledProcessError as e:
             print(f"[ERROR] Patch container failed: {e}")
             return False
+
+    def create_local_workspace_with_checkout(self,
+                                             repo_url: str,
+                                             commit_hash: str,
+                                             workspace_path: str,
+                                             patches: Optional[Dict[str, str]] = None,
+                                             root_dir: Optional[str] = None) -> bool:
+        """
+        Create a local workspace directory with git checkout and optional patches applied.
+
+        Args:
+            repo_url: Git repository URL
+            commit_hash: Commit hash to checkout
+            workspace_path: Local directory to populate
+            patches: Optional dict of file->patch_content mappings
+            root_dir: Optional subdirectory to extract (e.g., "external")
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            mirror_path = self.get_or_create_mirror(repo_url)
+            if os.path.exists(workspace_path):
+                import shutil
+                shutil.rmtree(workspace_path, ignore_errors=True)
+
+            subprocess.run(["git", "clone", mirror_path, workspace_path], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            subprocess.run(["git", "checkout", commit_hash], cwd=workspace_path, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+            if patches:
+                patch_dir = os.path.join(self.cache_dir, f"patches_local_{int(time.time())}")
+                os.makedirs(patch_dir, exist_ok=True)
+                self._prepare_patch_files(patch_dir, patches, root_dir)
+                patch_path = os.path.join(patch_dir, "patch.diff")
+                try:
+                    subprocess.run(["git", "apply", "-v", patch_path], cwd=workspace_path, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                finally:
+                    import shutil
+                    shutil.rmtree(patch_dir, ignore_errors=True)
+
+            if root_dir:
+                src_root = os.path.join(workspace_path, root_dir)
+                if not os.path.exists(src_root):
+                    print(f"[ERROR] root_dir '{root_dir}' not found in repo checkout")
+                    return False
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"[ERROR] Failed to create local workspace: {e}")
+            return False
+        except Exception as e:
+            print(f"[ERROR] Failed to create local workspace: {e}")
+            return False
     
 
     
@@ -443,7 +500,7 @@ class GitRepositoryManager:
 
 
 
-def get_git_manager(prefix: str) -> GitRepositoryManager:
+def get_git_manager(prefix: str, use_docker: bool = True) -> GitRepositoryManager:
     """
     Get a GitRepositoryManager instance for the given prefix.
     
@@ -454,4 +511,4 @@ def get_git_manager(prefix: str) -> GitRepositoryManager:
         GitRepositoryManager instance
     """
     cache_dir = os.path.join(prefix, "git_cache")
-    return GitRepositoryManager(cache_dir)
+    return GitRepositoryManager(cache_dir, use_docker=use_docker)

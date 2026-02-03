@@ -197,15 +197,19 @@ def run_samples(args: argparse.Namespace, n_samples: int, k_threshold: int) -> N
     
     print(f"Running in {'single issue' if args.id is not None else 'full benchmark'} mode")
     
-    # Validate commercial EDA tool setup
-    from src import commercial_eda
-    eda_validation = commercial_eda.validate_commercial_eda_setup(args.filename)
-    commercial_eda.print_commercial_eda_info(eda_validation)
-    
-    # Exit if EDA tool validation failed
-    if eda_validation['required'] and not eda_validation['validation_passed']:
-        print("\nCommercial EDA tool validation failed. Cannot proceed with EDA tool workflows.")
-        sys.exit(1)
+    use_docker_harness = getattr(args, 'harness_runner', 'docker') == "docker"
+    # Validate commercial EDA tool setup (Docker-based harness only)
+    if use_docker_harness:
+        from src import commercial_eda
+        eda_validation = commercial_eda.validate_commercial_eda_setup(args.filename)
+        commercial_eda.print_commercial_eda_info(eda_validation)
+        
+        # Exit if EDA tool validation failed
+        if eda_validation['required'] and not eda_validation['validation_passed']:
+            print("\nCommercial EDA tool validation failed. Cannot proceed with EDA tool workflows.")
+            sys.exit(1)
+    else:
+        eda_validation = {'required': False, 'validation_passed': True, 'network_name': None}
 
     # Create base directory if it doesn't exist
     os.makedirs(base_prefix, exist_ok=True)
@@ -237,7 +241,7 @@ def run_samples(args: argparse.Namespace, n_samples: int, k_threshold: int) -> N
     # Setup shared Docker network for all samples if not just regenerating reports
     shared_network_name = None
     license_network_auto_created = False  # Track if we auto-create the license network
-    if not regenerate_only:
+    if use_docker_harness and not regenerate_only:
         # Clean up filename to ensure consistent network naming
         filename = args.filename.replace('"', "").replace("'", "")
         

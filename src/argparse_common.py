@@ -45,6 +45,10 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     #                    help="Inform the system to run the docker locally.")
     parser.add_argument("-g", "--agent", type=str,
                        help="Select the agent to run the analysis.")
+    parser.add_argument("--agent-runner", choices=["docker", "local"], default="docker",
+                       help="Agent execution backend (docker or local).")
+    parser.add_argument("--agent-cmd", type=str,
+                       help="Local agent command to run when --agent-runner local is used.")
     
     # Local inference arguments (copilot mode only)
     parser.add_argument("--prompts-responses-file", type=str,
@@ -70,6 +74,9 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     # Note: Only --network-name (no short -n flag) to avoid collision with run_samples.py -n flag
     parser.add_argument("--network-name", type=str,
                        help="Use a specific Docker network name instead of auto-generating one")
+
+    parser.add_argument("--harness-runner", choices=["docker", "local"], default="docker",
+                       help="Harness execution backend (docker or local). Local mode expects local_harness.sh in the harness directory.")
     
     # Dataset transformation arguments
     parser.add_argument("--force-agentic", action="store_true",
@@ -144,6 +151,26 @@ def add_validation_checks(args: argparse.Namespace) -> None:
         if args.prompts_responses_file and args.agent:
             print("Error: Local inference modes are not compatible with --agent (agentic mode)")
             exit(1)
+
+    # Validate local agent execution requirements
+    if hasattr(args, 'agent_runner') and args.agent_runner == "local":
+        if not getattr(args, 'agent_cmd', None):
+            print("Error: --agent-runner local requires --agent-cmd")
+            exit(1)
+        if not getattr(args, 'agent', None):
+            print("Error: --agent-runner local requires --agent to name the agent (metadata only)")
+            exit(1)
+        if getattr(args, 'harness_runner', 'docker') != "local":
+            print("Error: --agent-runner local requires --harness-runner local (agent and harness must run in the same environment)")
+            exit(1)
+
+    if getattr(args, 'agent_cmd', None) and getattr(args, 'agent_runner', 'docker') != "local":
+        print("Error: --agent-cmd requires --agent-runner local")
+        exit(1)
+
+    if getattr(args, 'harness_runner', 'docker') == "local" and getattr(args, 'agent', None) and getattr(args, 'agent_runner', 'docker') != "local":
+        print("Error: --harness-runner local with agentic mode requires --agent-runner local")
+        exit(1)
 
 
 def clean_filename(filename: str) -> str:

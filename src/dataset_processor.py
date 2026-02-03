@@ -123,7 +123,7 @@ class DatasetProcessor():
     # - Constructor
     # ----------------------------------------
 
-    def __init__(self, filename : str, golden : bool = True, threads : int = 1, debug = False, host = False, prefix : str = None, network_name = None, manage_network = True):
+    def __init__(self, filename : str, golden : bool = True, threads : int = 1, debug = False, host = False, prefix : str = None, network_name = None, manage_network = True, harness_runner: str = "docker"):
         # Initialize the model
         self.model   = None
         self.context = {}
@@ -138,6 +138,7 @@ class DatasetProcessor():
         # Network settings
         self.network_name = network_name
         self.manage_network = manage_network
+        self.harness_runner = harness_runner
 
         # Centralized subjective scoring model management
         self._model_factory = ModelFactory()
@@ -439,7 +440,19 @@ When generating files, return the file name in the correct place at the folder s
         datapoint = self.context.get(id, {})
         requires_eda_license = commercial_eda.datapoint_requires_eda_license(datapoint)
         
-        repo = repository.Repository(name, issue, self.files [id], harness['files'] if harness and 'files' in harness else harness, patches, host=self.host, sbj_llm_model=self.sbj_llm_model, network_name=getattr(self, 'network_name', None), manage_network=getattr(self, 'manage_network', True), requires_eda_license=requires_eda_license)
+        repo = repository.Repository(
+            name,
+            issue,
+            self.files[id],
+            harness['files'] if harness and 'files' in harness else harness,
+            patches,
+            host=self.host,
+            sbj_llm_model=self.sbj_llm_model,
+            network_name=getattr(self, 'network_name', None),
+            manage_network=getattr(self, 'manage_network', True),
+            requires_eda_license=requires_eda_license,
+            harness_runner=getattr(self, 'harness_runner', 'docker')
+        )
         
         # Network configuration is now passed during construction, no need to set it after
         
@@ -1044,8 +1057,8 @@ When generating files, return the file name in the correct place at the folder s
         return result
 
 class CopilotProcessor (DatasetProcessor):
-    def __init__(self, filename : str = "", golden : bool = True, threads : int = 1, debug = False, host = False, prefix : str = None, network_name=None, manage_network=True, include_golden_patch=False, include_harness=False, refine_model=None):
-        super().__init__(filename, golden, threads, debug, host, prefix, network_name, manage_network)
+    def __init__(self, filename : str = "", golden : bool = True, threads : int = 1, debug = False, host = False, prefix : str = None, network_name=None, manage_network=True, include_golden_patch=False, include_harness=False, refine_model=None, harness_runner: str = "docker"):
+        super().__init__(filename, golden, threads, debug, host, prefix, network_name, manage_network, harness_runner)
         self.include_golden_patch = include_golden_patch
         self.include_harness = include_harness
         self.refined_datapoints = {}
@@ -1436,37 +1449,42 @@ class AgenticProcessor (DatasetProcessor):
     # - Process JSON File
     # ----------------------------------------
 
-    def __init__(self, filename : str, golden : bool = True, threads : int = 1, debug = False, host = False, prefix : str = None, network_name=None, manage_network=True):
-        super().__init__(filename, golden, threads, debug, host, prefix, network_name, manage_network)
+    def __init__(self, filename : str, golden : bool = True, threads : int = 1, debug = False, host = False, prefix : str = None, network_name=None, manage_network=True, harness_runner: str = "docker", agent_runner: str = "docker", agent_cmd: str = None):
+        super().__init__(filename, golden, threads, debug, host, prefix, network_name, manage_network, harness_runner)
         self.agent_results = {}
         # Directory size monitor
         self.dir_monitor = DirectorySizeMonitor()
         # Initialize include flags to False by default
         self.include_golden_patch = False
         self.include_harness = False
+        self.agent_runner = agent_runner
+        self.agent_cmd = agent_cmd
 
-        # Ensure patch_image Docker image exists for agentic heavy processing
-        result = subprocess.run(["docker", "images", "-q", "patch_image"],
-                                capture_output=True,
-                                text=True
-        )
+        if self.agent_runner == "docker" and self.harness_runner == "docker":
+            # Ensure patch_image Docker image exists for agentic heavy processing
+            result = subprocess.run(["docker", "images", "-q", "patch_image"],
+                                    capture_output=True,
+                                    text=True
+            )
 
-        if not result.stdout.strip():
+            if not result.stdout.strip():
 
-            # Ensure prefix directory exists
-            os.makedirs(self.prefix, exist_ok=True)
-            dockerfile = os.path.join(self.prefix, "Dockerfile.patch_image")
+                # Ensure prefix directory exists
+                os.makedirs(self.prefix, exist_ok=True)
+                dockerfile = os.path.join(self.prefix, "Dockerfile.patch_image")
 
-            print(f"[INFO] Docker image 'patch_image' not found, building it...")
-            with open(dockerfile, "w") as f:
-                f.write("FROM ubuntu:22.04\nRUN apt update && apt install -y git")
+                print(f"[INFO] Docker image 'patch_image' not found, building it...")
+                with open(dockerfile, "w") as f:
+                    f.write("FROM ubuntu:22.04\nRUN apt update && apt install -y git")
 
-            # Build image
-            subprocess.run(["docker", "build", "-t", "patch_image", "-f", dockerfile, "."],
-                            check=True)
+                # Build image
+                subprocess.run(["docker", "build", "-t", "patch_image", "-f", dockerfile, "."],
+                                check=True)
 
+            else:
+                print(f"[INFO] Docker image 'patch_image' already exists...")
         else:
-            print(f"[INFO] Docker image 'patch_image' already exists...")
+            print("[INFO] Skipping patch_image setup (non-Docker runner)")
 
     # ----------------------------------------
     # - Process JSON File
@@ -1495,11 +1513,36 @@ class AgenticProcessor (DatasetProcessor):
             # This avoids the space overhead of full context restoration while still providing the prompt
             import json
             minimal_context = {
-                'prompt.json': json.dumps({"prompt": self.context[id]['prompt']})
+                'prompt.json': json.dumps({
+                    "prompt": self.context[id].get('prompt', ''),
+                    "system_message": self.context[id].get('system_message', '')
+                })
             }
-            repo = repository.AgenticRepository(name, issue, minimal_context, harness, patches, host=self.host, network_name=getattr(self, 'network_name', None), manage_network=getattr(self, 'manage_network', True), requires_eda_license=requires_eda_license)
+            repo = repository.AgenticRepository(
+                name,
+                issue,
+                minimal_context,
+                harness,
+                patches,
+                host=self.host,
+                network_name=getattr(self, 'network_name', None),
+                manage_network=getattr(self, 'manage_network', True),
+                requires_eda_license=requires_eda_license,
+                harness_runner=getattr(self, 'harness_runner', 'docker')
+            )
         else:
-            repo = repository.Repository(name, issue, self.files [id], harness, patches, host=self.host, network_name=getattr(self, 'network_name', None), manage_network=getattr(self, 'manage_network', True), requires_eda_license=requires_eda_license)
+            repo = repository.Repository(
+                name,
+                issue,
+                self.files[id],
+                harness,
+                patches,
+                host=self.host,
+                network_name=getattr(self, 'network_name', None),
+                manage_network=getattr(self, 'manage_network', True),
+                requires_eda_license=requires_eda_license,
+                harness_runner=getattr(self, 'harness_runner', 'docker')
+            )
         
         # Network configuration is now passed during construction, no need to set it after
         
@@ -1515,7 +1558,10 @@ class AgenticProcessor (DatasetProcessor):
         issue_dir = os.path.join(self.prefix, "cvdp_" + "_".join(name[1:-1]))
 
         # add prompt.json to the context
-        context['prompt.json'] = json.dumps({"prompt" : self.context[id]['prompt']})
+        context['prompt.json'] = json.dumps({
+            "prompt": self.context[id].get('prompt', ''),
+            "system_message": self.context[id].get('system_message', '')
+        })
 
         if id in self.agent_results:
             return self.agent_results[id]
@@ -1566,6 +1612,9 @@ class AgenticProcessor (DatasetProcessor):
         
         use_git_workspace = False
         workspace_volume = None
+        workspace_root = None
+        workspace_root_dir = None
+        workspace_path = None
         
         # Determine if we should use git-based workspace
         if data_id:
@@ -1602,6 +1651,101 @@ class AgenticProcessor (DatasetProcessor):
                                 if hasattr(data['repo'], 'volume_name') and data['repo'].volume_name:
                                     workspace_volume = data['repo'].volume_name
                                     break
+
+        # Locate repository instance for workspace metadata
+        repo_instance = None
+        for _, data in self.runs.items():
+            if 'repo' in data and data['repo'] is not None:
+                if hasattr(data['repo'], 'issue_path') and data['repo'].issue_path == issue_path:
+                    repo_instance = data['repo']
+                    break
+        if repo_instance is not None:
+            workspace_root = getattr(repo_instance, 'workspace_root', None)
+            workspace_root_dir = getattr(repo_instance, 'workspace_root_dir', None)
+            workspace_path = getattr(repo_instance, 'workspace_path', None)
+
+        if self.agent_runner == "local":
+            # Run agent locally without Docker
+            issue_id = os.path.basename(issue_path)
+            harness_dir = os.path.dirname(issue_path)
+            repo_name = os.path.basename(os.path.dirname(harness_dir))
+
+            # Use repository's predefined reports path if available
+            if repo_instance is not None:
+                reports_dir = repo_instance.report_path
+            else:
+                reports_dir = os.path.join(os.path.dirname(os.path.dirname(issue_path)), "reports")
+            os.makedirs(reports_dir, exist_ok=True)
+            logfile = os.path.join(reports_dir, f"{issue_id}_agent.txt")
+
+            # Prepare compatibility files for context-heavy workspace
+            prompt_src = os.path.join(issue_path, "prompt.json")
+            prompt_path = prompt_src
+            if workspace_root:
+                prompt_dst = os.path.join(workspace_root, "prompt.json")
+                if os.path.exists(prompt_src):
+                    try:
+                        shutil.copyfile(prompt_src, prompt_dst)
+                        prompt_path = prompt_dst
+                    except Exception as e:
+                        print(f"[WARNING] Failed to copy prompt.json to workspace: {e}")
+                rundir_src = os.path.join(issue_path, "rundir")
+                rundir_dst = os.path.join(workspace_root, "rundir")
+                try:
+                    os.makedirs(rundir_src, exist_ok=True)
+                    if not os.path.exists(rundir_dst):
+                        os.symlink(rundir_src, rundir_dst)
+                except Exception:
+                    # Fall back to creating directory if symlink fails
+                    try:
+                        os.makedirs(rundir_dst, exist_ok=True)
+                    except Exception:
+                        pass
+
+            code_dir = workspace_path or issue_path
+            env = self._build_local_env(issue_path, code_dir=code_dir, prompt_path=prompt_path)
+
+            if not self.agent_cmd:
+                with open(logfile, 'w') as log_file:
+                    log_file.write("Error: --agent-cmd is required for local agent runner\n")
+                return 1, logfile
+
+            cwd = workspace_root or issue_path
+            monitor_dir = issue_path
+
+            print(f"Running local agent command: {self.agent_cmd}")
+            with open(logfile, 'w') as log_file:
+                p = subprocess.Popen(self.agent_cmd, shell=True, cwd=cwd, stdout=log_file, stderr=subprocess.STDOUT, env=env)
+                pid = p.pid
+                if monitor_size:
+                    kill_cmd = f"kill -9 {pid}"
+                    self.dir_monitor.start_monitoring(
+                        directory=monitor_dir,
+                        process_id=pid,
+                        kill_cmd=kill_cmd
+                    )
+                try:
+                    p.communicate(timeout=repository.DOCKER_TIMEOUT)
+                    returncode = p.returncode
+                except subprocess.TimeoutExpired:
+                    print(f'Timeout for local agent ({repository.DOCKER_TIMEOUT}s) expired')
+                    if hasattr(repository, 'kill_process_tree'):
+                        repository.kill_process_tree(p.pid)
+                    else:
+                        try:
+                            p.kill()
+                        except Exception:
+                            pass
+                    returncode = 1
+
+            # For context-heavy workspaces, generate patch from git diff
+            if workspace_root:
+                try:
+                    self._generate_git_changes_patch(workspace_root, issue_path, root_dir=workspace_root_dir)
+                except Exception as e:
+                    print(f"[WARNING] Failed to generate git changes patch: {e}")
+
+            return returncode, logfile
         
         # Create docker-compose configuration for the agent
         if use_git_workspace and workspace_volume:
@@ -2315,6 +2459,90 @@ class AgenticProcessor (DatasetProcessor):
                 pass
             return None
 
+    def _load_env_file(self, env_path):
+        env = {}
+        if not os.path.exists(env_path):
+            return env
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    if key:
+                        env[key] = value
+        except Exception as e:
+            print(f"Warning: Failed to parse env file {env_path}: {e}")
+        return env
+
+    def _build_local_env(self, issue_path, code_dir=None, prompt_path=None):
+        code_dir = code_dir or issue_path
+        prompt_path = prompt_path or os.path.join(issue_path, "prompt.json")
+        env = os.environ.copy()
+        env.update({
+            "CVDP_ISSUE_DIR": os.path.abspath(issue_path),
+            "CVDP_CODE_DIR": os.path.abspath(code_dir),
+            "CVDP_WORKSPACE_DIR": os.path.abspath(code_dir),
+            "CVDP_DOCS_DIR": os.path.abspath(os.path.join(code_dir, "docs")),
+            "CVDP_RTL_DIR": os.path.abspath(os.path.join(code_dir, "rtl")),
+            "CVDP_VERIF_DIR": os.path.abspath(os.path.join(code_dir, "verif")),
+            "CVDP_RUNDIR_DIR": os.path.abspath(os.path.join(issue_path, "rundir")),
+            "CVDP_SRC_DIR": os.path.abspath(os.path.join(issue_path, "src")),
+            "CVDP_PROMPT_JSON": os.path.abspath(prompt_path),
+        })
+        env_file = os.path.join(issue_path, "src", ".env")
+        env.update(self._load_env_file(env_file))
+        return env
+
+    def _generate_git_changes_patch(self, workspace_root: str, issue_path: str, root_dir: str = None):
+        try:
+            diff_cmd = ["git", "-C", workspace_root, "diff"]
+            if root_dir:
+                diff_cmd.extend(["--relative", root_dir, "--", root_dir])
+            result = subprocess.run(diff_cmd, capture_output=True, text=True, check=False)
+            diff_output = result.stdout or ""
+
+            # Include untracked files
+            untracked_cmd = ["git", "-C", workspace_root, "ls-files", "--others", "--exclude-standard"]
+            untracked_res = subprocess.run(untracked_cmd, capture_output=True, text=True, check=False)
+            for rel in untracked_res.stdout.splitlines():
+                if root_dir:
+                    if not rel.startswith(root_dir + "/"):
+                        continue
+                    rel_path = os.path.relpath(rel, root_dir)
+                else:
+                    rel_path = rel
+                abs_path = os.path.join(workspace_root, rel)
+                if not os.path.isfile(abs_path):
+                    continue
+                diff_new = subprocess.run(["diff", "-u", "/dev/null", abs_path], capture_output=True, text=True, check=False).stdout
+                if diff_new:
+                    diff_new = diff_new.replace(abs_path, f"b/{rel_path}")
+                    if diff_output and not diff_output.endswith("\n"):
+                        diff_output += "\n"
+                    diff_output += diff_new
+
+            patch_file = os.path.join(issue_path, "agent_changes.patch")
+            if diff_output.strip():
+                with open(patch_file, "w", encoding="utf-8") as f:
+                    f.write(diff_output)
+            else:
+                with open(patch_file, "w", encoding="utf-8") as f:
+                    f.write("# No changes detected\n")
+        except Exception as e:
+            print(f"[WARNING] Failed to generate git diff patch: {e}")
+            try:
+                status_file = os.path.join(issue_path, "agent_changes.patch")
+                with open(status_file, "w", encoding="utf-8") as f:
+                    f.write(f"# Error generating patch: {e}\n")
+            except Exception as e2:
+                print(f"[ERROR] Failed to create error status file: {e2}")
+
     def create_repo (self, id : str, model : OpenAI_Instance = None):
         """
         Clone & checkout a real git repo (via CLI flags or JSON fields),
@@ -2341,8 +2569,9 @@ class AgenticProcessor (DatasetProcessor):
         if repo_url and commit_sha:
             print(f"[DEBUG:create_repo-Agentic] Starting datapoint preparation for id={id}")
 
-            # Use GitRepositoryManager for consistent volume management
-            git_manager = git_utils.get_git_manager(self.prefix)
+            use_docker_workspace = (self.agent_runner == "docker" and self.harness_runner == "docker")
+            # Use GitRepositoryManager for consistent volume/workspace management
+            git_manager = git_utils.get_git_manager(self.prefix, use_docker=use_docker_workspace)
             volume_name = f"{id}_workspace"
             
             # Get patches if available
@@ -2351,56 +2580,97 @@ class AgenticProcessor (DatasetProcessor):
             # Determine root directory (extract only external/ folder for CVDP repos)
             root_dir = "external" if 'cvdp_' in repo_url or 'cvdp-' in repo_url else None
             
-            # Create the git workspace using the consolidated approach
-            success = git_manager.create_volume_with_checkout(
-                repo_url=repo_url,
-                commit_hash=commit_sha,
-                volume_name=volume_name,
-                patches=patches,
-                root_dir=root_dir
-            )
-            
-            if not success:
-                print(f"[ERROR] Failed to create git workspace for {id}, falling back to regular mode")
-                # Fall through to the regular mode below
-            else:
-                (_, repo) = self.create_repository(id, harness, name, issue, {})
-                repo.volume_name = volume_name
+            if use_docker_workspace:
+                # Create the git workspace using Docker volumes
+                success = git_manager.create_volume_with_checkout(
+                    repo_url=repo_url,
+                    commit_hash=commit_sha,
+                    volume_name=volume_name,
+                    patches=patches,
+                    root_dir=root_dir
+                )
                 
-                # Register automatic cleanup for the volume
-                import atexit
-                def cleanup_volume():
-                    try:
-                        print(f"[INFO] Cleaning up workspace volume: {volume_name}")
-                        import subprocess
-                        subprocess.run(
-                            ["docker", "volume", "rm", "-f", volume_name],
-                            check=False,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE
+                if not success:
+                    print(f"[ERROR] Failed to create git workspace for {id}, falling back to regular mode")
+                    # Fall through to the regular mode below
+                else:
+                    (_, repo) = self.create_repository(id, harness, name, issue, {})
+                    repo.volume_name = volume_name
+                    repo.workspace_root = None
+                    repo.workspace_root_dir = root_dir
+                    
+                    # Register automatic cleanup for the volume
+                    import atexit
+                    def cleanup_volume():
+                        try:
+                            print(f"[INFO] Cleaning up workspace volume: {volume_name}")
+                            import subprocess
+                            subprocess.run(
+                                ["docker", "volume", "rm", "-f", volume_name],
+                                check=False,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE
+                            )
+                        except Exception as e:
+                            print(f"[WARNING] Failed to cleanup workspace volume {volume_name}: {e}")
+                    
+                    # Only register cleanup once per volume
+                    cleanup_attr = f"_cleanup_volume_{id}_registered"
+                    if not hasattr(atexit, cleanup_attr):
+                        atexit.register(cleanup_volume)
+                        setattr(atexit, cleanup_attr, True)
+                        print(f"[INFO] Registered automatic cleanup for volume: {volume_name}")
+                    
+                    # Create workspace volume script for context heavy datapoints
+                    if 'agentic_heavy' in id:
+                        # Create script in the same directory as other scripts (issue_path)
+                        repo.create_workspace_volume_script(
+                            docker_dir=repo.issue_path,
+                            repo_url=repo_url,
+                            commit_hash=commit_sha,
+                            patches=patches,
+                            root_dir=root_dir
                         )
-                    except Exception as e:
-                        print(f"[WARNING] Failed to cleanup workspace volume {volume_name}: {e}")
-                
-                # Only register cleanup once per volume
-                cleanup_attr = f"_cleanup_volume_{id}_registered"
-                if not hasattr(atexit, cleanup_attr):
-                    atexit.register(cleanup_volume)
-                    setattr(atexit, cleanup_attr, True)
-                    print(f"[INFO] Registered automatic cleanup for volume: {volume_name}")
-                
-                # Create workspace volume script for context heavy datapoints
-                if 'agentic_heavy' in id:
-                    # Create script in the same directory as other scripts (issue_path)
-                    repo.create_workspace_volume_script(
-                        docker_dir=repo.issue_path,
-                        repo_url=repo_url,
-                        commit_hash=commit_sha,
-                        patches=patches,
-                        root_dir=root_dir
-                    )
-                
-                return (True, repo)
+                    
+                    return (True, repo)
+            else:
+                # Create local workspace directory (no Docker)
+                workspace_root = os.path.join(git_manager.cache_dir, "workspaces")
+                os.makedirs(workspace_root, exist_ok=True)
+                workspace_path = os.path.join(workspace_root, volume_name)
+
+                success = git_manager.create_local_workspace_with_checkout(
+                    repo_url=repo_url,
+                    commit_hash=commit_sha,
+                    workspace_path=workspace_path,
+                    patches=patches,
+                    root_dir=root_dir
+                )
+
+                if not success:
+                    print(f"[ERROR] Failed to create local workspace for {id}, falling back to regular mode")
+                else:
+                    (_, repo) = self.create_repository(id, harness, name, issue, {})
+                    repo.workspace_root = workspace_path
+                    repo.workspace_root_dir = root_dir
+                    repo.workspace_path = os.path.join(workspace_path, root_dir) if root_dir else workspace_path
+
+                    # Register cleanup for local workspace
+                    import atexit
+                    def cleanup_workspace():
+                        try:
+                            print(f"[INFO] Cleaning up local workspace: {workspace_path}")
+                            shutil.rmtree(workspace_path, ignore_errors=True)
+                        except Exception as e:
+                            print(f"[WARNING] Failed to cleanup local workspace {workspace_path}: {e}")
+
+                    cleanup_attr = f"_cleanup_workspace_{id}_registered"
+                    if not hasattr(atexit, cleanup_attr):
+                        atexit.register(cleanup_workspace)
+                        setattr(atexit, cleanup_attr, True)
+                        print(f"[INFO] Registered automatic cleanup for workspace: {workspace_path}")
+
+                    return (True, repo)
 
         else:
             # 5) Fallback: original JSON‐dump into self.files[id]

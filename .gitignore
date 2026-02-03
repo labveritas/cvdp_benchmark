@@ -2,6 +2,10 @@ cvdp_*
 *.json
 *.jsonl
 !/example_dataset/*.jsonl
+!cvdp-benchmark-dataset/
+!cvdp-benchmark-dataset/**/
+!cvdp-benchmark-dataset/*.jsonl
+!cvdp-benchmark-dataset/**/*.jsonl
 *.log
 __pycache__
 /.env

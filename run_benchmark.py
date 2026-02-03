@@ -362,7 +362,10 @@ if __name__ == "__main__":
             force_agentic_include_golden=args.force_agentic_include_golden,
             force_agentic_include_harness=args.force_agentic_include_harness,
             force_copilot=args.force_copilot,
-            copilot_refine=args.copilot_refine
+            copilot_refine=args.copilot_refine,
+            harness_runner=getattr(args, 'harness_runner', 'docker'),
+            agent_runner=getattr(args, 'agent_runner', 'docker'),
+            agent_cmd=getattr(args, 'agent_cmd', None)
         )
         # Get the transformed filename (if any transformation was applied)
         if args.force_agentic:
@@ -372,20 +375,24 @@ if __name__ == "__main__":
         
         print(f"Using transformed dataset: {filename}")
 
-    # Validate commercial EDA tool setup
-    from src import commercial_eda
-    eda_validation = commercial_eda.validate_commercial_eda_setup(filename)
-    commercial_eda.print_commercial_eda_info(eda_validation)
-    
-    # Exit if EDA tool validation failed
-    if eda_validation['required'] and not eda_validation['validation_passed']:
-        print("\nCommercial EDA tool validation failed. Cannot proceed with EDA tool workflows.")
-        sys.exit(1)
+    use_docker_harness = getattr(args, 'harness_runner', 'docker') == "docker"
+    # Validate commercial EDA tool setup (Docker-based harness only)
+    if use_docker_harness:
+        from src import commercial_eda
+        eda_validation = commercial_eda.validate_commercial_eda_setup(filename)
+        commercial_eda.print_commercial_eda_info(eda_validation)
+        
+        # Exit if EDA tool validation failed
+        if eda_validation['required'] and not eda_validation['validation_passed']:
+            print("\nCommercial EDA tool validation failed. Cannot proceed with EDA tool workflows.")
+            sys.exit(1)
+    else:
+        eda_validation = {'required': False, 'validation_passed': True, 'network_name': None}
 
-    # Handle Docker network setup
+    # Handle Docker network setup (Docker-based harness only)
     shared_network_name = None
     license_network_auto_created = False  # Track if we auto-create the license network
-    if not args.regenerate_report:
+    if use_docker_harness and not args.regenerate_report:
         if args.network_name:
             # Use the specified network name for the default network
             shared_network_name = args.network_name
@@ -456,6 +463,7 @@ if __name__ == "__main__":
         'prefix': args.prefix,
         'custom_factory_path': args.custom_factory,
         'copilot_refine': args.copilot_refine,
+        'harness_runner': getattr(args, 'harness_runner', 'docker'),
         **network_args
     }
 
@@ -468,6 +476,8 @@ if __name__ == "__main__":
             'force_copilot': args.force_copilot,
             'repo_url': args.repo_url,
             'commit_hash': args.commit_hash,
+            'agent_runner': getattr(args, 'agent_runner', 'docker'),
+            'agent_cmd': getattr(args, 'agent_cmd', None),
         })
         obj = AgenticBenchmark(**wrapper_args)
         obj.agent = args.agent

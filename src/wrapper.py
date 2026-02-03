@@ -12,8 +12,8 @@ import sys
 
 class CopilotWrapper:
 
-    def __init__(self, filename, golden = True, debug = False, host = False, prefix = None, custom_factory_path = None, network_name = None, manage_network = True, copilot_refine = None):
-        self.repo = dataset_processor.CopilotProcessor(filename = filename, golden = golden, debug = debug, host = host, prefix = prefix, network_name = network_name, manage_network = manage_network)
+    def __init__(self, filename, golden = True, debug = False, host = False, prefix = None, custom_factory_path = None, network_name = None, manage_network = True, copilot_refine = None, harness_runner = "docker"):
+        self.repo = dataset_processor.CopilotProcessor(filename = filename, golden = golden, debug = debug, host = host, prefix = prefix, network_name = network_name, manage_network = manage_network, harness_runner = harness_runner)
         # Enable refinement if requested
         if copilot_refine:
             self.repo.include_golden_patch = True
@@ -34,6 +34,7 @@ class CopilotWrapper:
         self.copilot_refine         = copilot_refine
         self.network_name           = network_name
         self.manage_network         = manage_network
+        self.harness_runner         = harness_runner
 
     def create_model(self, version = None, **kwargs):
         if version is None:
@@ -98,13 +99,14 @@ class CopilotWrapper:
             network=self.network_name,
             include_golden_patch=True,
             include_harness=True,
-            refine_model=self.copilot_refine
+            refine_model=self.copilot_refine,
+            harness_runner=self.harness_runner
         )
         return copilot_input.run(model)
 
 class AgenticWrapper (CopilotWrapper):
 
-    def __init__(self, filename, golden = True, debug = False, host = False, prefix = None, custom_factory_path = None, network_name = None, manage_network = True, force_agentic = False, force_agentic_include_golden = False, force_agentic_include_harness = False, force_copilot = False, copilot_refine = None, repo_url = None, commit_hash = None):
+    def __init__(self, filename, golden = True, debug = False, host = False, prefix = None, custom_factory_path = None, network_name = None, manage_network = True, force_agentic = False, force_agentic_include_golden = False, force_agentic_include_harness = False, force_copilot = False, copilot_refine = None, repo_url = None, commit_hash = None, harness_runner = "docker", agent_runner = "docker", agent_cmd = None):
         self.force_agentic = force_agentic
         self.force_agentic_include_golden = force_agentic_include_golden
         self.force_agentic_include_harness = force_agentic_include_harness
@@ -116,7 +118,7 @@ class AgenticWrapper (CopilotWrapper):
         # The transformation is now handled before creating the wrapper
         # but we keep the transformation methods available
         
-        self.repo = dataset_processor.AgenticProcessor(filename = filename, golden = golden, debug = debug, host = host, prefix = prefix, network_name = network_name, manage_network = manage_network)
+        self.repo = dataset_processor.AgenticProcessor(filename = filename, golden = golden, debug = debug, host = host, prefix = prefix, network_name = network_name, manage_network = manage_network, harness_runner = harness_runner, agent_runner = agent_runner, agent_cmd = agent_cmd)
         
         # Pass the include parameters to the repo
         self.repo.include_golden_patch = force_agentic_include_golden
@@ -138,6 +140,9 @@ class AgenticWrapper (CopilotWrapper):
         self.golden = golden
         self.network_name = network_name
         self.manage_network = manage_network
+        self.harness_runner = harness_runner
+        self.agent_runner   = agent_runner
+        self.agent_cmd      = agent_cmd
         
         # For refinement
         if copilot_refine:

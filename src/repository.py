@@ -154,7 +154,8 @@ class Repository:
             sbj_llm_model    = None,
             network_name = None,
             manage_network = True,
-            requires_eda_license = False
+            requires_eda_license = False,
+            harness_runner = "docker"
         ):
 
         self.name         = repo
@@ -168,6 +169,10 @@ class Repository:
         self.debug        = debug
         self.sbj_llm_model    = sbj_llm_model  # Added LLM model parameter
         self.requires_eda_license = requires_eda_license  # Flag indicating if this datapoint requires EDA license network
+        self.harness_runner = harness_runner
+        self.workspace_path = None  # Optional workspace override for local runner (context-heavy)
+        self.workspace_root = None
+        self.workspace_root_dir = None
         # Network info
         self.network_name = network_name
         self.manage_network = manage_network
@@ -496,6 +501,111 @@ class Repository:
                 pass
         
         return result
+
+    def _load_env_file(self, env_path):
+        env = {}
+        if not os.path.exists(env_path):
+            return env
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    if key:
+                        env[key] = value
+        except Exception as e:
+            print(f"Warning: Failed to parse env file {env_path}: {e}")
+        return env
+
+    def _build_cvdp_env(self, issue_path):
+        code_dir = self.workspace_path or issue_path
+        env = {
+            "CVDP_ISSUE_DIR": os.path.abspath(issue_path),
+            "CVDP_CODE_DIR": os.path.abspath(code_dir),
+            "CVDP_WORKSPACE_DIR": os.path.abspath(code_dir),
+            "CVDP_DOCS_DIR": os.path.abspath(os.path.join(code_dir, "docs")),
+            "CVDP_RTL_DIR": os.path.abspath(os.path.join(code_dir, "rtl")),
+            "CVDP_VERIF_DIR": os.path.abspath(os.path.join(code_dir, "verif")),
+            "CVDP_RUNDIR_DIR": os.path.abspath(os.path.join(issue_path, "rundir")),
+            "CVDP_SRC_DIR": os.path.abspath(os.path.join(issue_path, "src")),
+            "CVDP_PROMPT_JSON": os.path.abspath(os.path.join(issue_path, "prompt.json")),
+        }
+        return env
+
+    def _run_local_process(self, cmd, logfile, cwd, env, monitor_dir=None):
+        start_time = time.time()
+        with open(logfile, "w+") as out:
+            p = subprocess.Popen(cmd, cwd=cwd, stdout=out, stderr=subprocess.STDOUT, env=env)
+            pid = p.pid
+            if monitor_dir is not None and hasattr(self, 'dir_monitor'):
+                kill_cmd = f"kill -9 {pid}"
+                self.dir_monitor.start_monitoring(
+                    directory=monitor_dir,
+                    process_id=pid,
+                    kill_cmd=kill_cmd
+                )
+            try:
+                p.communicate(timeout=DOCKER_TIMEOUT)
+                returncode = p.returncode
+            except subprocess.TimeoutExpired:
+                print(f"Timeout for {' '.join(cmd)} ({DOCKER_TIMEOUT}s) expired")
+                kill_process_tree(p.pid)
+                returncode = 1
+        return {"result": returncode, "log": logfile, "error_msg": None, "execution": time.time() - start_time, "pid": pid}
+
+    def _find_local_harness_script(self, issue_path):
+        candidates = [
+            os.path.join(issue_path, "local_harness.sh"),
+            os.path.join(issue_path, "src", "local_harness.sh"),
+            os.path.join(issue_path, "local_harness.py"),
+            os.path.join(issue_path, "src", "local_harness.py"),
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        return None
+
+    def _obj_harness_local(self, issue_path: str = "", logfile: str = ""):
+        local_script = self._find_local_harness_script(issue_path)
+        docker_compose = os.path.join(issue_path, "docker-compose.yml")
+        if not local_script:
+            if os.path.exists(docker_compose):
+                msg = "local_harness.sh not found (required for --harness-runner local)"
+                return ([{"result": 1, "log": None, "error_msg": msg, "execution": 0}], 1)
+            # Fall back to objective LLM evaluation if no harness exists
+            return None
+        local_script = os.path.abspath(local_script)
+
+        # Build environment
+        env = os.environ.copy()
+        env.update(self._build_cvdp_env(issue_path))
+        env_file = os.path.join(issue_path, "src", ".env")
+        env.update(self._load_env_file(env_file))
+
+        # Choose command
+        if local_script.endswith(".py"):
+            cmd = ["python", local_script]
+        elif local_script.endswith(".sh"):
+            cmd = ["bash", local_script]
+        else:
+            cmd = [local_script]
+
+        service_log = f"{logfile}_local.txt"
+        result = self._run_local_process(
+            cmd=cmd,
+            logfile=service_log,
+            cwd=issue_path,
+            env=env,
+            monitor_dir=issue_path
+        )
+        error = result["result"]
+        return ([result], error)
 
     def create_workspace_volume_script(self, docker_dir, repo_url=None, commit_hash=None, patches=None, root_dir=None):
         """
@@ -931,6 +1041,11 @@ class Repository:
 
         docker = os.path.join(f"{issue_path}", "docker-compose.yml")
 
+        if self.harness_runner == "local":
+            local_result = self._obj_harness_local(issue_path, logfile)
+            if local_result is not None:
+                return local_result
+
         if os.path.exists(docker):
 
             with open(docker, 'r') as f:
@@ -1057,10 +1172,11 @@ class AgenticRepository(Repository):
             host         = False,
             network_name = None,
             manage_network = True,
-            requires_eda_license = False
+            requires_eda_license = False,
+            harness_runner = "docker"
         ):
 
-        super().__init__(repo, id, context, harness, patches, debug, host, network_name=network_name, manage_network=manage_network, requires_eda_license=requires_eda_license)
+        super().__init__(repo, id, context, harness, patches, debug, host, network_name=network_name, manage_network=manage_network, requires_eda_license=requires_eda_license, harness_runner=harness_runner)
         self.volume_name = None
 
     def prepare(self):
