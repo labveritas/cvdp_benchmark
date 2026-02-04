@@ -17,7 +17,9 @@ from typing import Any, Optional, Tuple
 import yaml
 
 
-_TO_UNSIGNED_RE = re.compile(r"([A-Za-z0-9_\[\]\(\)\.]+)\.to_unsigned\(\)")
+_TO_UNSIGNED_CALL_RE = re.compile(r"([A-Za-z0-9_\[\]\(\)\.]+)\.to_unsigned\(\)")
+_TO_SIGNED_CALL_RE = re.compile(r"([A-Za-z0-9_\[\]\(\)\.]+)\.to_signed\(\)")
+_INTEGER_ATTR_RE = re.compile(r"([A-Za-z0-9_\[\]\(\)\.]+)\.integer\b")
 
 
 def _bash_single_quote(value: str) -> str:
@@ -182,12 +184,25 @@ def _load_shim(shim_root: Path) -> Tuple[str, str, str]:
     )
 
 
-def _rewrite_to_unsigned(text: str) -> str:
-    def _replace(match: re.Match[str]) -> str:
+def _rewrite_cocotb_compat(text: str) -> str:
+    def _replace_unsigned(match: re.Match[str]) -> str:
         expr = match.group(1)
-        return f"{expr}.integer"
+        return f"cvdp_to_unsigned({expr})"
 
-    return _TO_UNSIGNED_RE.sub(_replace, text)
+    def _replace_signed(match: re.Match[str]) -> str:
+        expr = match.group(1)
+        return f"cvdp_to_signed({expr})"
+
+    def _replace_integer(match: re.Match[str]) -> str:
+        expr = match.group(1)
+        if expr.endswith("signed_"):
+            return match.group(0)
+        return f"cvdp_to_unsigned({expr})"
+
+    text = _TO_SIGNED_CALL_RE.sub(_replace_signed, text)
+    text = _TO_UNSIGNED_CALL_RE.sub(_replace_unsigned, text)
+    text = _INTEGER_ATTR_RE.sub(_replace_integer, text)
+    return text
 
 
 def _rewrite_harness_sources(harness: dict) -> None:
@@ -196,7 +211,7 @@ def _rewrite_harness_sources(harness: dict) -> None:
             continue
         if not path.endswith(".py"):
             continue
-        rewritten = _rewrite_to_unsigned(contents)
+        rewritten = _rewrite_cocotb_compat(contents)
         if rewritten != contents:
             harness[path] = rewritten
 
