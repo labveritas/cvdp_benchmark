@@ -17,6 +17,9 @@ from typing import Any, Optional, Tuple
 import yaml
 
 
+_TO_UNSIGNED_RE = re.compile(r"([A-Za-z0-9_\[\]\(\)\.]+)\.to_unsigned\(\)")
+
+
 def _bash_single_quote(value: str) -> str:
     # Safe single-quote for bash: close, escape, reopen
     return "'" + value.replace("'", "'\"'\"'") + "'"
@@ -179,6 +182,25 @@ def _load_shim(shim_root: Path) -> Tuple[str, str, str]:
     )
 
 
+def _rewrite_to_unsigned(text: str) -> str:
+    def _replace(match: re.Match[str]) -> str:
+        expr = match.group(1)
+        return f"{expr}.integer"
+
+    return _TO_UNSIGNED_RE.sub(_replace, text)
+
+
+def _rewrite_harness_sources(harness: dict) -> None:
+    for path, contents in list(harness.items()):
+        if not isinstance(contents, str):
+            continue
+        if not path.endswith(".py"):
+            continue
+        rewritten = _rewrite_to_unsigned(contents)
+        if rewritten != contents:
+            harness[path] = rewritten
+
+
 def build_local_dataset(input_path: Path, output_path: Path, shim_root: Path) -> None:
     shim_init, shim_runner, shim_site = _load_shim(shim_root)
 
@@ -201,6 +223,7 @@ def build_local_dataset(input_path: Path, output_path: Path, shim_root: Path) ->
                 harness.setdefault("src/cocotb_tools/__init__.py", shim_init)
                 harness.setdefault("src/cocotb_tools/runner.py", shim_runner)
                 harness.setdefault("src/sitecustomize.py", shim_site)
+                _rewrite_harness_sources(harness)
             fout.write(json.dumps(obj, ensure_ascii=True) + "\n")
 
 

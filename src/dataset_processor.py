@@ -897,6 +897,21 @@ When generating files, return the file name in the correct place at the folder s
                 error_msg = self.runs[id]['agent_error']
                 logging.warning(f"Found agent error for {id}: {error_msg}")
                 # We still continue with execution as we may have partial results
+
+            # Skip harness if agent produced no actionable output
+            if id in self.runs and self.runs[id].get('skip_harness'):
+                error_msg = self.runs[id].get('agent_error', 'Agent produced no actionable output')
+                logging.warning(f"Skipping {id} due to agent output: {error_msg}")
+                category = self.context[id]['categories'][0]
+                difficulty = self.context[id]['categories'][1]
+                error_result = {
+                    "category": category,
+                    "difficulty": difficulty,
+                    "tests": [{"result": 1, "log": self.runs[id].get('agent_logfile'), "error_msg": f"Agent error: {error_msg}", "execution": 0.0}],
+                    "errors": 1
+                }
+                q.put({id: error_result})
+                return
             
             # Run the normal execution
             res = self.run(
@@ -1003,6 +1018,22 @@ When generating files, return the file name in the correct place at the folder s
         create_jsonl(os.path.join(self.prefix, 'prompt_response.jsonl'), jsonl)
 
     def run(self, id : str = "", obj : bool = False, repo : repository.Repository = None, model : OpenAI_Instance = None):
+        # Skip harness execution if agent produced no actionable output
+        if id in self.runs and self.runs[id].get('skip_harness'):
+            error_msg = self.runs[id].get('agent_error', 'Agent produced no actionable output')
+            logging.warning(f"Skipping {id} execution: {error_msg}")
+            result = {
+                "category": self.context[id]['categories'][0],
+                "difficulty": self.context[id]['categories'][1],
+                "tests": [{
+                    "result": 1,
+                    "log": self.runs[id].get('agent_logfile'),
+                    "error_msg": f"Agent error: {error_msg}",
+                    "execution": 0.0
+                }],
+                "errors": 1
+            }
+            return result
 
         cat = int(self.context[id]['categories'][0][3:])
 
@@ -1725,10 +1756,11 @@ class AgenticProcessor (DatasetProcessor):
                         kill_cmd=kill_cmd
                     )
                 try:
-                    p.communicate(timeout=repository.DOCKER_TIMEOUT)
+                    agent_timeout = getattr(repository, "DOCKER_TIMEOUT_AGENT", repository.DOCKER_TIMEOUT)
+                    p.communicate(timeout=agent_timeout)
                     returncode = p.returncode
                 except subprocess.TimeoutExpired:
-                    print(f'Timeout for local agent ({repository.DOCKER_TIMEOUT}s) expired')
+                    print(f'Timeout for local agent ({agent_timeout}s) expired')
                     if hasattr(repository, 'kill_process_tree'):
                         repository.kill_process_tree(p.pid)
                     else:
@@ -2170,6 +2202,18 @@ class AgenticProcessor (DatasetProcessor):
                         error_msg = f"Agent process exited with non-zero status: {agent_status}"
                         logging.error(error_msg)
                         result['agent_error'] = error_msg
+                    
+                    # Read agent status if available (do not skip harness if missing)
+                    status_path = os.path.join(issue_path, "rundir", "agent_status.json")
+                    if os.path.exists(status_path):
+                        try:
+                            with open(status_path, "r", encoding="utf-8") as f:
+                                status = json.load(f)
+                            result['agent_status'] = status
+                        except Exception as e:
+                            logging.warning(f"Failed to read agent status: {e}")
+                    else:
+                        logging.warning("Agent status missing")
                 
             else:
                 # Traditional agent processing for non-context-heavy datapoints
@@ -2196,6 +2240,18 @@ class AgenticProcessor (DatasetProcessor):
                         logging.error(error_msg)
                         # Store error but also continue to process any files that might have been created
                         result['agent_error'] = error_msg
+                    
+                    # Read agent status if available (do not skip harness if missing)
+                    status_path = os.path.join(issue_path, "rundir", "agent_status.json")
+                    if os.path.exists(status_path):
+                        try:
+                            with open(status_path, "r", encoding="utf-8") as f:
+                                status = json.load(f)
+                            result['agent_status'] = status
+                        except Exception as e:
+                            logging.warning(f"Failed to read agent status: {e}")
+                    else:
+                        logging.warning("Agent status missing")
                     
                     # Clean up any stray Docker resources (with error suppression)
                     try:
@@ -2284,6 +2340,10 @@ class AgenticProcessor (DatasetProcessor):
             if id in self.runs:
                 if 'agent_error' in result:
                     self.runs[id]['agent_error'] = result['agent_error']
+                if 'skip_harness' in result:
+                    self.runs[id]['skip_harness'] = result['skip_harness']
+                if 'agent_status' in result:
+                    self.runs[id]['agent_status'] = result['agent_status']
             
         except Exception as e:
             error_msg = str(e)

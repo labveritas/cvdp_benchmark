@@ -16,7 +16,7 @@ import datetime
 import re
 import tempfile
 import subprocess
-from typing import List, Optional
+from typing import List, Optional, Tuple, Dict, Any
 
 from google import genai
 try:
@@ -81,6 +81,21 @@ class FileChange(BaseModel):
 class AgentResponse(BaseModel):
     files: List[FileChange] = Field(default_factory=list)
     summary: Optional[str] = None
+
+
+_ALLOWED_COMMANDS = {
+    "ls",
+    "tree",
+    "cat",
+    "echo",
+    "iverilog",
+    "vvp",
+    "sed",
+    "awk",
+    "pwd",
+    "diff",
+    "find",
+}
 
 
 def _get_genai_client():
@@ -214,6 +229,153 @@ def _extract_patch(text: str) -> Optional[str]:
     return patch_text or None
 
 
+def _extract_action_blocks(text: str) -> List[str]:
+    if not text:
+        return []
+    blocks = []
+    current: List[str] = []
+    in_action = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        lower = stripped.lower()
+        if lower.startswith("action"):
+            if in_action and current:
+                blocks.append("\n".join(current).strip())
+                current = []
+            in_action = True
+            if ":" in line:
+                rest = line.split(":", 1)[1].strip()
+                if rest:
+                    current.append(rest)
+            continue
+        if in_action and (lower.startswith("thought") or lower.startswith("observation") or lower.startswith("final") or lower.startswith("patch")):
+            if current:
+                blocks.append("\n".join(current).strip())
+                current = []
+            in_action = False
+            continue
+        if in_action:
+            current.append(line)
+    if in_action and current:
+        blocks.append("\n".join(current).strip())
+    return [b for b in blocks if b]
+
+
+def _update_quote_state(line: str, state: Optional[str]) -> Optional[str]:
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if ch == "\\" and state != "single":
+            i += 2
+            continue
+        if ch == "'" and state != "double":
+            state = None if state == "single" else "single"
+        elif ch == '"' and state != "single":
+            state = None if state == "double" else "double"
+        i += 1
+    return state
+
+
+def _split_commands(block: str) -> List[str]:
+    commands: List[str] = []
+    current: List[str] = []
+    quote_state: Optional[str] = None
+    for line in block.splitlines():
+        if not current and not line.strip():
+            continue
+        current.append(line)
+        quote_state = _update_quote_state(line, quote_state)
+        if quote_state is None and not line.rstrip().endswith("\\"):
+            cmd = "\n".join(current).strip()
+            if cmd:
+                commands.append(cmd)
+            current = []
+    if current:
+        cmd = "\n".join(current).strip()
+        if cmd:
+            commands.append(cmd)
+    return commands
+
+
+def _rewrite_command_paths(cmd: str, code_dir: str) -> str:
+    issue_dir = os.getenv("CVDP_ISSUE_DIR", code_dir)
+    src_dir = os.path.join(issue_dir, "src")
+    rundir = os.path.join(issue_dir, "rundir")
+    cmd = cmd.replace("/code/rundir", rundir)
+    cmd = cmd.replace("/code", code_dir)
+    cmd = cmd.replace("/src", src_dir)
+    cmd = re.sub(r'(^|[\\s=])/rundir', r'\\1' + rundir, cmd)
+    return cmd
+
+
+def _is_allowed_command(cmd: str) -> bool:
+    stripped = cmd.strip()
+    if not stripped:
+        return False
+    first = stripped.split()[0]
+    return first in _ALLOWED_COMMANDS
+
+
+def _extract_malformed_call_text(raw: dict) -> Optional[str]:
+    if not isinstance(raw, dict):
+        return None
+    candidates = raw.get("candidates") or []
+    for cand in candidates:
+        msg = cand.get("finish_message") or ""
+        if "call" in msg:
+            idx = msg.find("call")
+            if idx != -1:
+                return msg[idx + 4 :].strip()
+    return None
+
+
+def _execute_action_commands(text: str, response_raw: dict, code_dir: str) -> Tuple[int, List[str]]:
+    blocks = _extract_action_blocks(text)
+    if not blocks and response_raw:
+        malformed = _extract_malformed_call_text(response_raw)
+        if malformed:
+            print("DEBUG: Detected malformed function call text, treating as action block")
+            blocks = [malformed]
+    if not blocks:
+        print("DEBUG: No action blocks found in LLM response")
+        return 0, ["no action blocks found"]
+    executed = 0
+    errors = []
+    for block in blocks:
+        for cmd in _split_commands(block):
+            if not _is_allowed_command(cmd):
+                errors.append(f"blocked command: {cmd.splitlines()[0][:200]}")
+                continue
+            cmd = _rewrite_command_paths(cmd, code_dir)
+            try:
+                first = cmd.strip().split()[0]
+                quiet = first in {"ls", "tree", "find", "pwd"}
+                stdout = subprocess.DEVNULL if quiet else subprocess.PIPE
+                print(f"DEBUG: Executing command: {cmd.splitlines()[0][:200]}")
+                result = subprocess.run(
+                    cmd,
+                    shell=True,
+                    cwd=code_dir,
+                    stdout=stdout,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    err = (result.stderr or result.stdout or "").strip()
+                    errors.append(err or f"command failed: {cmd.splitlines()[0][:200]}")
+                else:
+                    executed += 1
+            except Exception as exc:
+                errors.append(str(exc))
+    if executed > 0:
+        print(f"DEBUG: Executed {executed} command(s), errors: {len(errors)}")
+    else:
+        print(f"DEBUG: No commands executed, errors: {len(errors)}")
+    return executed, errors
+
+
 def _sanitize_patch(patch_text: str) -> str:
     allowed_prefixes = ("diff ", "index ", "--- ", "+++ ", "@@ ", "+", "-", " ", "\\ No newline")
     lines = patch_text.splitlines()
@@ -276,9 +438,20 @@ def _get_response_text(response) -> str:
     return "\n".join(parts)
 
 
-def _call_llm(prompt: str, system_message: str, rtl_files: List[str], code_dir: str) -> AgentResponse:
+def _call_llm(prompt: str, system_message: str, rtl_files: List[str], code_dir: str) -> Tuple[AgentResponse, Dict[str, Any]]:
     model = os.getenv("CVDP_LLM_MODEL", "gemini-3-flash-preview")
     client = _get_genai_client()
+    status: Dict[str, Any] = {
+        "model": model,
+        "llm_response_text_len": 0,
+        "tool_calls": 0,
+        "parsed_json": False,
+        "patch_applied": False,
+        "commands_executed": 0,
+        "commands_errors": 0,
+        "actionable_output": False,
+        "error": None,
+    }
 
     system_msg = system_message or ""
     user_msg = prompt or ""
@@ -303,6 +476,9 @@ def _call_llm(prompt: str, system_message: str, rtl_files: List[str], code_dir: 
         else:
             response = client.models.generate_content(model=model, contents=contents)
         text = _get_response_text(response)
+        status["llm_response_text_len"] = len(text or "")
+        status["tool_calls"] = len(_extract_tool_calls(response))
+        print(f"DEBUG: LLM response length={status['llm_response_text_len']} tool_calls={status['tool_calls']}")
         _log_llm_step(code_dir, {
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
             "model": model,
@@ -316,26 +492,65 @@ def _call_llm(prompt: str, system_message: str, rtl_files: List[str], code_dir: 
         if json_text:
             try:
                 data = json.loads(json_text)
-                return AgentResponse(**data)
+                status["parsed_json"] = True
+                status["actionable_output"] = True
+                print("DEBUG: Parsed JSON response successfully")
+                return AgentResponse(**data), status
             except Exception as e:
                 patch_text = _extract_patch(text)
                 if patch_text:
                     try:
                         _apply_patch(code_dir, patch_text)
-                        return AgentResponse(files=[], summary=None)
+                        status["patch_applied"] = True
+                        status["actionable_output"] = True
+                        print("DEBUG: Applied patch from LLM response")
+                        return AgentResponse(files=[], summary=None), status
                     except Exception as patch_error:
-                        return AgentResponse(files=[], summary=f"ERROR: {patch_error}")
-                return AgentResponse(files=[], summary=f"ERROR: {e}")
+                        executed, errors = _execute_action_commands(text, _serialize_response(response), code_dir)
+                        status["commands_executed"] = executed
+                        status["commands_errors"] = len(errors)
+                        if executed:
+                            status["actionable_output"] = True
+                            return AgentResponse(files=[], summary=f"executed {executed} command(s); errors: {len(errors)}"), status
+                        status["error"] = f"{patch_error}"
+                        return AgentResponse(files=[], summary=f"ERROR: {patch_error}"), status
+                executed, errors = _execute_action_commands(text, _serialize_response(response), code_dir)
+                status["commands_executed"] = executed
+                status["commands_errors"] = len(errors)
+                if executed:
+                    status["actionable_output"] = True
+                    return AgentResponse(files=[], summary=f"executed {executed} command(s); errors: {len(errors)}"), status
+                status["error"] = f"{e}"
+                return AgentResponse(files=[], summary=f"ERROR: {e}"), status
         patch_text = _extract_patch(text)
         if patch_text:
             try:
                 _apply_patch(code_dir, patch_text)
-                return AgentResponse(files=[], summary=None)
+                status["patch_applied"] = True
+                status["actionable_output"] = True
+                print("DEBUG: Applied patch from LLM response")
+                return AgentResponse(files=[], summary=None), status
             except Exception as patch_error:
-                return AgentResponse(files=[], summary=f"ERROR: {patch_error}")
-        return AgentResponse(files=[], summary="ERROR: Failed to parse model response")
+                executed, errors = _execute_action_commands(text, _serialize_response(response), code_dir)
+                status["commands_executed"] = executed
+                status["commands_errors"] = len(errors)
+                if executed:
+                    status["actionable_output"] = True
+                    return AgentResponse(files=[], summary=f"executed {executed} command(s); errors: {len(errors)}"), status
+                status["error"] = f"{patch_error}"
+                return AgentResponse(files=[], summary=f"ERROR: {patch_error}"), status
+        executed, errors = _execute_action_commands(text, _serialize_response(response), code_dir)
+        status["commands_executed"] = executed
+        status["commands_errors"] = len(errors)
+        if executed:
+            status["actionable_output"] = True
+            return AgentResponse(files=[], summary=f"executed {executed} command(s); errors: {len(errors)}"), status
+        status["error"] = "Failed to parse model response"
+        return AgentResponse(files=[], summary="ERROR: Failed to parse model response"), status
     except Exception as e:
-        return AgentResponse(files=[], summary=f"ERROR: {e}")
+        status["error"] = str(e)
+        print(f"DEBUG: LLM call failed: {e}")
+        return AgentResponse(files=[], summary=f"ERROR: {e}"), status
 
 
 def run_agent(prompt, system_message):
@@ -344,7 +559,7 @@ def run_agent(prompt, system_message):
 
     rtl_files = list_directory_files(os.path.join(code_dir, "rtl"))
 
-    response = _call_llm(prompt, system_message, rtl_files, code_dir)
+    response, status = _call_llm(prompt, system_message, rtl_files, code_dir)
 
     # Apply file updates
     for change in response.files:
@@ -359,9 +574,17 @@ def run_agent(prompt, system_message):
     # Write a simple report
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     rundir = os.getenv("CVDP_RUNDIR_DIR", os.path.join(code_dir, "rundir"))
+    os.makedirs(rundir, exist_ok=True)
     write_file(os.path.join(rundir, "agent_executed.txt"), f"Agent executed at {timestamp}\nPrompt: {prompt}\n")
     if response.summary:
         write_file(os.path.join(code_dir, "docs", "agent_report.md"), response.summary)
+    status_path = os.path.join(rundir, "agent_status.json")
+    try:
+        with open(status_path, "w", encoding="utf-8") as f:
+            json.dump(status, f, ensure_ascii=False, indent=2)
+        print(f"DEBUG: Wrote agent status to {status_path}")
+    except Exception as e:
+        print(f"DEBUG: Failed to write agent status: {e}")
 
 def main():
     """Main agent function"""

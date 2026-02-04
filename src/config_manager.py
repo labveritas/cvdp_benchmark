@@ -92,7 +92,7 @@ class ConfigManager:
                            description="Timeout for task operations in seconds")
         self.register_config("DOCKER_TIMEOUT", default=600, type_cast=int,
                            description="Timeout for Docker operations in seconds")
-        self.register_config("DOCKER_TIMEOUT_AGENT", default=600, type_cast=int,
+        self.register_config("DOCKER_TIMEOUT_AGENT", default=1800, type_cast=int,
                            description="Timeout for Docker agent operations in seconds")
         self.register_config("QUEUE_TIMEOUT", default=None, type_cast=int,
                            description="Queue timeout in seconds")

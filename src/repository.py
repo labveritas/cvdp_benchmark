@@ -597,6 +597,7 @@ class Repository:
             cmd = [local_script]
 
         service_log = f"{logfile}_local.txt"
+        print(f"Running local harness, log: {service_log}")
         result = self._run_local_process(
             cmd=cmd,
             logfile=service_log,
